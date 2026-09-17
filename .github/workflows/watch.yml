@@ -1,0 +1,41 @@
+name: Plaza watcher
+
+on:
+  schedule:
+    # Every 30 minutes a fresh job starts; each job then polls the feed
+    # once a minute for 29 minutes, so in practice you are checked ~every
+    # 60 seconds. GitHub's scheduler can be a few minutes late - the
+    # overlapping window plus the concurrency rule below covers that.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: # lets you run it by hand from the Actions tab
+
+concurrency:
+  group: plaza-watcher
+  cancel-in-progress: true
+
+permissions:
+  contents: write # needed to commit the "already seen" state file
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Watch for new listings
+        env:
+          WHATSAPP_RECIPIENTS: ${{ secrets.WHATSAPP_RECIPIENTS }}
+          WATCH_REGIONS: "Nederland - Zuid-Holland"
+          WATCH_CITIES: "Delft"
+          URGENT_CITIES: "Delft"
+          EXCLUDE_CATEGORIES: "voorVoertuig"
+          MAX_RENT: "0"
+          POLL_MINUTES: "29"
+          POLL_SECONDS: "60"
+          GIT_PERSIST: "1"
+        run: python watcher.py
