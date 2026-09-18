@@ -1,38 +1,30 @@
-
-Watch · YML
 name: Plaza watcher
- 
+
 on:
   schedule:
-    # GitHub throttles cron hard on free runners - firings get skipped for
-    # hours at a time. So this is not "the check": it is only an attempt to
-    # (re)start a long-lived watcher. Each job polls the feed for ~5h50m,
-    # which is just under GitHub's 6 hour job limit, and any firing that
-    # does get through cancels the running job and starts a fresh window.
-    # Coverage therefore survives GitHub skipping several firings in a row.
     - cron: "0 * * * *"
-  workflow_dispatch: # run it by hand from the Actions tab
+  workflow_dispatch:
   push:
-    branches: [main] # any commit also restarts the watcher
- 
+    branches: [main]
+
 concurrency:
   group: plaza-watcher
   cancel-in-progress: true
- 
+
 permissions:
-  contents: write # needed to commit the "already seen" state file
- 
+  contents: write
+
 jobs:
   watch:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
- 
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
- 
+
       - name: Watch for new listings
         env:
           WHATSAPP_RECIPIENTS: ${{ secrets.WHATSAPP_RECIPIENTS }}
@@ -45,6 +37,3 @@ jobs:
           POLL_SECONDS: "60"
           GIT_PERSIST: "1"
         run: python watcher.py
- 
-
-
