@@ -1,32 +1,38 @@
-name: Plaza watcher
 
+Watch · YML
+name: Plaza watcher
+ 
 on:
   schedule:
-    # Every 30 minutes a fresh job starts; each job then polls the feed
-    # once a minute for 29 minutes, so in practice you are checked ~every
-    # 60 seconds. GitHub's scheduler can be a few minutes late - the
-    # overlapping window plus the concurrency rule below covers that.
-    - cron: "*/30 * * * *"
-  workflow_dispatch: # lets you run it by hand from the Actions tab
-
+    # GitHub throttles cron hard on free runners - firings get skipped for
+    # hours at a time. So this is not "the check": it is only an attempt to
+    # (re)start a long-lived watcher. Each job polls the feed for ~5h50m,
+    # which is just under GitHub's 6 hour job limit, and any firing that
+    # does get through cancels the running job and starts a fresh window.
+    # Coverage therefore survives GitHub skipping several firings in a row.
+    - cron: "0 * * * *"
+  workflow_dispatch: # run it by hand from the Actions tab
+  push:
+    branches: [main] # any commit also restarts the watcher
+ 
 concurrency:
   group: plaza-watcher
   cancel-in-progress: true
-
+ 
 permissions:
   contents: write # needed to commit the "already seen" state file
-
+ 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
-
+ 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
+ 
       - name: Watch for new listings
         env:
           WHATSAPP_RECIPIENTS: ${{ secrets.WHATSAPP_RECIPIENTS }}
@@ -35,7 +41,10 @@ jobs:
           URGENT_CITIES: "Delft"
           EXCLUDE_CATEGORIES: "voorVoertuig"
           MAX_RENT: "0"
-          POLL_MINUTES: "29"
+          POLL_MINUTES: "350"
           POLL_SECONDS: "60"
           GIT_PERSIST: "1"
         run: python watcher.py
+ 
+
+
