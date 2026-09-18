@@ -9,10 +9,11 @@ on:
 
 concurrency:
   group: plaza-watcher
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   watch:
@@ -37,3 +38,10 @@ jobs:
           POLL_SECONDS: "60"
           GIT_PERSIST: "1"
         run: python watcher.py
+
+      - name: Hand off to the next watcher
+        if: success() || failure()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run watch.yml --ref main
