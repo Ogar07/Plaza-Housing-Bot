@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
-"""
-Plaza Resident Services housing watcher.
-
-Polls the public listings feed of plaza.newnewnew.space, keeps track of which
-listings it has already seen, and sends a WhatsApp message to every configured
-recipient when a new listing appears in the regions/cities being watched.
-
-Standard library only - no pip install needed.
-"""
+"""Plaza Resident Services housing watcher."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
-import time
+import time as time_module
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
-# --------------------------------------------------------------------------
-# Configuration (everything can be overridden with environment variables)
-# --------------------------------------------------------------------------
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 API_URL = os.environ.get(
     "PLAZA_URL",
@@ -35,36 +29,39 @@ OVERVIEW_URL = "https://plaza.newnewnew.space/aanbod/wonen"
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state/seen.json"))
 
-# A listing matches if its region starts with one of these...
 WATCH_REGIONS = [
     r.strip().lower()
     for r in os.environ.get("WATCH_REGIONS", "Nederland - Zuid-Holland").split(",")
     if r.strip()
 ]
-# ...or its city is one of these (kept separate so you can add cities in other
-# provinces without widening the whole region filter).
 WATCH_CITIES = [
     c.strip().lower()
     for c in os.environ.get("WATCH_CITIES", "Delft").split(",")
     if c.strip()
 ]
-# Cities that get the loud treatment in the message.
 URGENT_CITIES = [
     c.strip().lower()
     for c in os.environ.get("URGENT_CITIES", "Delft").split(",")
     if c.strip()
 ]
-# dwellingType.categorie values to ignore (parking spots, storage boxes...).
 EXCLUDE_CATEGORIES = [
     c.strip().lower()
     for c in os.environ.get("EXCLUDE_CATEGORIES", "voorVoertuig").split(",")
     if c.strip()
 ]
-# 0 = no cap. Compared against totalRent (rent incl. service costs).
 MAX_RENT = float(os.environ.get("MAX_RENT", "0") or 0)
 
-# "Name:+31612345678:apikey, Name:+48...:apikey" - one entry per recipient.
 RECIPIENTS_RAW = os.environ.get("WHATSAPP_RECIPIENTS", "")
+
+HEARTBEAT_HOURS = sorted(
+    {
+        int(h.strip())
+        for h in os.environ.get("HEARTBEAT_HOURS", "10,16").split(",")
+        if h.strip().isdigit()
+    }
+)
+HEARTBEAT_TZ = os.environ.get("HEARTBEAT_TZ", "Europe/Amsterdam")
+HEARTBEAT_TO = os.environ.get("HEARTBEAT_TO", "first").strip().lower()
 
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in {"1", "true", "yes"}
 GIT_PERSIST = os.environ.get("GIT_PERSIST", "").lower() in {"1", "true", "yes"}
@@ -73,7 +70,7 @@ POLL_MINUTES = float(os.environ.get("POLL_MINUTES", "0") or 0)
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "60") or 60)
 
 MAX_LISTINGS_IN_MESSAGE = 5
-USER_AGENT = "Mozilla/5.0 (compatible; plaza-watcher/1.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; plaza-watcher/1.1)"
 
 
 def log(msg: str) -> None:
@@ -81,13 +78,16 @@ def log(msg: str) -> None:
     print(f"[{stamp}] {msg}", flush=True)
 
 
-# --------------------------------------------------------------------------
-# Fetching and filtering
-# --------------------------------------------------------------------------
+def local_now() -> datetime:
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(HEARTBEAT_TZ))
+        except Exception as exc:
+            log(f"timezone {HEARTBEAT_TZ} unavailable ({exc}); using UTC")
+    return datetime.now(timezone.utc)
 
 
 def fetch_listings() -> list[dict]:
-    """Return the raw list of currently published objects."""
     req = urllib.request.Request(
         API_URL,
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -139,7 +139,6 @@ def listing_id(obj: dict) -> str:
 
 
 def describe(obj: dict) -> str:
-    """One compact block of text per listing, for the WhatsApp message."""
     dwelling = obj.get("dwellingType") or {}
     kind = (dwelling.get("localizedName") or "Woning").strip()
 
@@ -203,13 +202,38 @@ def build_message(new_objects: list[dict]) -> str:
     return f"{header}\n\n{body}"
 
 
-# --------------------------------------------------------------------------
-# Notification
-# --------------------------------------------------------------------------
+def due_heartbeat_slot(now: datetime) -> str | None:
+    if not HEARTBEAT_HOURS:
+        return None
+    passed = []
+    for days_back in (0, 1):
+        day = (now - timedelta(days=days_back)).date()
+        for hour in HEARTBEAT_HOURS:
+            slot = datetime.combine(day, time(hour), tzinfo=now.tzinfo)
+            if slot <= now:
+                passed.append(slot)
+    if not passed:
+        return None
+    return max(passed).strftime("%Y-%m-%dT%H")
+
+
+def heartbeat_text(matching: int, state: dict, now: datetime) -> str:
+    where = ", ".join(w.title() for w in WATCH_CITIES) or "the watched area"
+    lines = [
+        f"Plaza watcher check-in, {now:%a %d %b %H:%M} ({HEARTBEAT_TZ}).",
+        f"Still running. Tracking {matching} listing(s) in {where} and the "
+        "watched region.",
+    ]
+    last_new = state.get("last_new")
+    lines.append(
+        f"Last new listing alert: {last_new}."
+        if last_new
+        else "No new listing has appeared since the watcher started."
+    )
+    return "\n".join(lines)
 
 
 def parse_recipients(raw: str) -> list[tuple[str, str, str]]:
-    """Parse 'Name:+31...:apikey, Name:+48...:apikey' into tuples."""
     people = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -224,7 +248,6 @@ def parse_recipients(raw: str) -> list[tuple[str, str, str]]:
 
 
 def send_whatsapp(name: str, phone: str, apikey: str, text: str) -> bool:
-    """Send one message through the CallMeBot free WhatsApp relay."""
     url = "https://api.callmebot.com/whatsapp.php?" + urllib.parse.urlencode(
         {"phone": phone, "text": text, "apikey": apikey}
     )
@@ -233,32 +256,66 @@ def send_whatsapp(name: str, phone: str, apikey: str, text: str) -> bool:
         return True
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = resp.read(400).decode("utf-8", "replace")
-        log(f"sent to {name} ({phone}): HTTP {resp.status} {body[:120]!r}")
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            status = resp.status
+            raw = resp.read(8000).decode("utf-8", "replace")
+
+        reply = " ".join(re.sub(r"<[^>]+>", " ", raw).split())
+        reply = re.sub(
+            r"Text to send:.*?(?=(Message queued|APIKEY|$))", "", reply, flags=re.I
+        )
+        reply = reply.strip() or "(empty reply)"
+
+        bad = any(
+            marker in reply.lower()
+            for marker in (
+                "not valid",
+                "invalid",
+                "not activated",
+                "error",
+                "wrong",
+                "denied",
+                "not allowed",
+            )
+        )
+        if status != 200 or bad:
+            log(
+                f"WARNING - {name} ({phone}) not delivered: "
+                f"HTTP {status} :: {reply[:400]}"
+            )
+            return False
+
+        log(f"sent to {name} ({phone}): HTTP {status} :: {reply[:400]}")
         return True
     except urllib.error.HTTPError as exc:
         log(f"FAILED to send to {name}: HTTP {exc.code} {exc.reason}")
-    except Exception as exc:  # noqa: BLE001 - never let a send crash the watcher
+    except Exception as exc:
         log(f"FAILED to send to {name}: {exc}")
     return False
 
 
-def notify_all(text: str) -> None:
-    people = parse_recipients(RECIPIENTS_RAW)
+def notify(text: str, people: list[tuple[str, str, str]] | None = None) -> None:
+    if people is None:
+        people = parse_recipients(RECIPIENTS_RAW)
     if not people:
         log("no recipients configured (WHATSAPP_RECIPIENTS is empty)")
         log(text)
         return
     for index, (name, phone, apikey) in enumerate(people):
         if index:
-            time.sleep(8)  # CallMeBot throttles rapid-fire requests
+            time_module.sleep(8)
         send_whatsapp(name, phone, apikey, text)
 
 
-# --------------------------------------------------------------------------
-# State
-# --------------------------------------------------------------------------
+def notify_all(text: str) -> None:
+    notify(text)
+
+
+def notify_heartbeat(text: str) -> None:
+    people = parse_recipients(RECIPIENTS_RAW)
+    if HEARTBEAT_TO != "all":
+        people = people[:1]
+    notify(text, people)
 
 
 def load_state() -> dict:
@@ -271,22 +328,15 @@ def load_state() -> dict:
         return {}
 
 
-def save_state(seen: list[str]) -> None:
+def save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(
-        json.dumps(
-            {
-                "updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "seen": seen[-500:],  # keep the file small
-            },
-            indent=1,
-        )
-        + "\n"
-    )
+    payload = dict(state)
+    payload["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    payload["seen"] = list(payload.get("seen") or [])[-500:]
+    STATE_FILE.write_text(json.dumps(payload, indent=1) + "\n")
 
 
 def git_persist_state() -> None:
-    """Commit the state file back to the repo so the next run remembers."""
     if not GIT_PERSIST:
         return
     try:
@@ -303,7 +353,7 @@ def git_persist_state() -> None:
             ["git", "diff", "--cached", "--quiet"], timeout=30
         ).returncode
         if status == 0:
-            return  # nothing changed
+            return
         subprocess.run(
             ["git", "commit", "-m", "watcher: update seen listings"],
             check=True,
@@ -312,20 +362,14 @@ def git_persist_state() -> None:
         subprocess.run(["git", "pull", "--rebase", "--autostash"], timeout=120)
         subprocess.run(["git", "push"], check=True, timeout=120)
         log("state committed to repo")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"could not persist state to git: {exc}")
 
 
-# --------------------------------------------------------------------------
-# One check
-# --------------------------------------------------------------------------
-
-
 def check_once() -> bool:
-    """Returns True if the state changed."""
     try:
         listings = fetch_listings()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log(f"fetch failed: {exc}")
         return False
 
@@ -337,7 +381,9 @@ def check_once() -> bool:
 
     state = load_state()
     seen = list(state.get("seen") or [])
-    first_run = not seen and "seen" not in state
+    first_run = "seen" not in state
+    now = local_now()
+    slot = due_heartbeat_slot(now)
 
     current_ids = [listing_id(o) for o in interesting if listing_id(o)]
     new_objects = [
@@ -345,7 +391,9 @@ def check_once() -> bool:
     ]
 
     if first_run:
-        save_state(current_ids)
+        state["seen"] = current_ids
+        state["last_heartbeat"] = slot
+        save_state(state)
         git_persist_state()
         notify_all(
             "Plaza watcher is live. Now tracking "
@@ -354,14 +402,25 @@ def check_once() -> bool:
         )
         return True
 
-    if not new_objects:
-        return False
+    changed = False
 
-    log(f"NEW: {[listing_id(o) for o in new_objects]}")
-    notify_all(build_message(new_objects))
-    save_state(seen + [listing_id(o) for o in new_objects])
-    git_persist_state()
-    return True
+    if new_objects:
+        log(f"NEW: {[listing_id(o) for o in new_objects]}")
+        notify_all(build_message(new_objects))
+        state["seen"] = seen + [listing_id(o) for o in new_objects]
+        state["last_new"] = now.strftime("%d %b %H:%M")
+        changed = True
+
+    if slot and state.get("last_heartbeat") != slot:
+        log(f"heartbeat due for slot {slot}")
+        notify_heartbeat(heartbeat_text(len(interesting), state, now))
+        state["last_heartbeat"] = slot
+        changed = True
+
+    if changed:
+        save_state(state)
+        git_persist_state()
+    return changed
 
 
 def main() -> int:
@@ -369,14 +428,18 @@ def main() -> int:
         check_once()
         return 0
 
-    deadline = time.monotonic() + POLL_MINUTES * 60
-    log(f"polling every {POLL_SECONDS:.0f}s for {POLL_MINUTES:.0f} minutes")
-    while time.monotonic() < deadline:
+    deadline = time_module.monotonic() + POLL_MINUTES * 60
+    log(
+        f"polling every {POLL_SECONDS:.0f}s for {POLL_MINUTES:.0f} minutes; "
+        f"heartbeat at {HEARTBEAT_HOURS} {HEARTBEAT_TZ} to "
+        f"{'everyone' if HEARTBEAT_TO == 'all' else 'the first recipient'}"
+    )
+    while time_module.monotonic() < deadline:
         check_once()
-        remaining = deadline - time.monotonic()
+        remaining = deadline - time_module.monotonic()
         if remaining <= 0:
             break
-        time.sleep(min(POLL_SECONDS, remaining))
+        time_module.sleep(min(POLL_SECONDS, remaining))
     log("poll window finished")
     return 0
 
